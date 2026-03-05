@@ -1,5 +1,4 @@
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
-import fastifyCors from "@fastify/cors";
 import got from "got";
 import chalk from "chalk";
 
@@ -11,6 +10,7 @@ type StartProxyOptions = {
   origin: string;
   rejectUnauthorized: boolean;
   debug: boolean;
+  browserHeaders: boolean;
 };
 
 const PROXY_METHODS: Array<"DELETE" | "GET" | "HEAD" | "PATCH" | "POST" | "PUT"> = [
@@ -34,6 +34,40 @@ const normalizeHeaderValue = (
   }
 
   return String(value);
+};
+
+const shouldStripResponseHeader = (headerName: string): boolean => {
+  const normalized = headerName.toLowerCase();
+
+  if (normalized.startsWith("access-control-")) {
+    return true;
+  }
+
+  const blockedByName = new Set([
+    "clear-site-data",
+    "content-disposition",
+    "content-security-policy",
+    "content-security-policy-report-only",
+    "cross-origin-embedder-policy",
+    "cross-origin-embedder-policy-report-only",
+    "cross-origin-opener-policy",
+    "cross-origin-opener-policy-report-only",
+    "cross-origin-resource-policy",
+    "document-policy",
+    "nel",
+    "origin-agent-cluster",
+    "permissions-policy",
+    "referrer-policy",
+    "report-to",
+    "x-content-security-policy",
+    "x-content-type-options",
+    "x-download-options",
+    "x-frame-options",
+    "x-permitted-cross-domain-policies",
+    "x-webkit-csp",
+  ]);
+
+  return blockedByName.has(normalized);
 };
 
 const getDebugTimestamp = (): string => new Date().toISOString();
@@ -70,6 +104,75 @@ const logDebug = (
   };
 
   console.log(`[lcp-debug] ${JSON.stringify(payload)}`);
+};
+
+const buildRequestHeaders = (
+  incomingHeaders: FastifyRequest["headers"],
+  method: string,
+  browserHeaders: boolean
+): Record<string, string | string[] | undefined> => {
+  const requestHeaders: Record<string, string | string[] | undefined> = {};
+  const blockedRequestHeaders = new Set([
+    "connection",
+    "host",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+  ]);
+
+  for (const [headerName, headerValue] of Object.entries(incomingHeaders)) {
+    const normalizedName = headerName.toLowerCase();
+    if (headerValue === undefined || blockedRequestHeaders.has(normalizedName)) {
+      continue;
+    }
+
+    requestHeaders[normalizedName] = headerValue as string | string[];
+  }
+
+  if (!browserHeaders) {
+    return requestHeaders;
+  }
+
+  if (!requestHeaders["user-agent"]) {
+    requestHeaders["user-agent"] =
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+      "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
+  }
+  if (!requestHeaders.accept) {
+    requestHeaders.accept =
+      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp," +
+      "image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7";
+  }
+  if (!requestHeaders["accept-language"]) {
+    requestHeaders["accept-language"] = "en-US,en;q=0.9";
+  }
+  if (!requestHeaders["accept-encoding"]) {
+    requestHeaders["accept-encoding"] = "gzip, deflate, br";
+  }
+
+  if (method === "GET") {
+    if (!requestHeaders["upgrade-insecure-requests"]) {
+      requestHeaders["upgrade-insecure-requests"] = "1";
+    }
+    if (!requestHeaders["sec-fetch-mode"]) {
+      requestHeaders["sec-fetch-mode"] = "navigate";
+    }
+    if (!requestHeaders["sec-fetch-dest"]) {
+      requestHeaders["sec-fetch-dest"] = "document";
+    }
+    if (!requestHeaders["sec-fetch-site"]) {
+      requestHeaders["sec-fetch-site"] = "none";
+    }
+    if (!requestHeaders["sec-fetch-user"]) {
+      requestHeaders["sec-fetch-user"] = "?1";
+    }
+  }
+
+  return requestHeaders;
 };
 
 const rewriteLocationHeader = (
@@ -116,52 +219,98 @@ const rewriteLocationHeader = (
   }
 };
 
+const buildProxyPublicBaseUrl = (
+  request: FastifyRequest,
+  routePrefix: string
+): string => {
+  const host = String(request.headers.host ?? "localhost");
+  const forwardedProto = request.headers["x-forwarded-proto"];
+  const protocol = typeof forwardedProto === "string" ? forwardedProto : "http";
+  return `${protocol}://${host}${routePrefix}`;
+};
+
+const shouldRewriteBody = (method: string, contentTypeHeader: unknown): boolean => {
+  if (method !== "GET") {
+    return false;
+  }
+
+  const contentType = String(contentTypeHeader ?? "");
+  return /text\/html|application\/javascript|text\/javascript|application\/json/i.test(
+    contentType
+  );
+};
+
+const replaceAllOccurrences = (
+  source: string,
+  searchValue: string,
+  replaceValue: string
+): { text: string; count: number } => {
+  if (!searchValue || searchValue === replaceValue) {
+    return { text: source, count: 0 };
+  }
+
+  const escapedSearch = searchValue.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(escapedSearch, "g");
+  const matches = source.match(pattern);
+  const count = matches ? matches.length : 0;
+  if (count === 0) {
+    return { text: source, count: 0 };
+  }
+  return { text: source.replace(pattern, replaceValue), count };
+};
+
+const rewriteResponseBodyText = (
+  originalText: string,
+  proxyUrl: string,
+  proxyPublicBaseUrl: string
+): { text: string; replacementCount: number } => {
+  const parsedProxyUrl = new URL(proxyUrl);
+  const candidates = new Set<string>();
+  const hostname = parsedProxyUrl.hostname;
+  const withWww = hostname.startsWith("www.") ? hostname : `www.${hostname}`;
+  const withoutWww = hostname.startsWith("www.") ? hostname.slice(4) : hostname;
+
+  candidates.add(`${parsedProxyUrl.protocol}//${withWww}`);
+  candidates.add(`${parsedProxyUrl.protocol}//${withoutWww}`);
+
+  let rewrittenText = originalText;
+  let replacementCount = 0;
+
+  for (const sourceOrigin of candidates) {
+    const plain = replaceAllOccurrences(rewrittenText, sourceOrigin, proxyPublicBaseUrl);
+    rewrittenText = plain.text;
+    replacementCount += plain.count;
+
+    const slashEscapedSource = sourceOrigin.replace(/\//g, "\\/");
+    const slashEscapedProxy = proxyPublicBaseUrl.replace(/\//g, "\\/");
+    const slashEscaped = replaceAllOccurrences(
+      rewrittenText,
+      slashEscapedSource,
+      slashEscapedProxy
+    );
+    rewrittenText = slashEscaped.text;
+    replacementCount += slashEscaped.count;
+
+    const encodedSource = encodeURIComponent(sourceOrigin);
+    const encodedProxy = encodeURIComponent(proxyPublicBaseUrl);
+    const encoded = replaceAllOccurrences(rewrittenText, encodedSource, encodedProxy);
+    rewrittenText = encoded.text;
+    replacementCount += encoded.count;
+  }
+
+  return { text: rewrittenText, replacementCount };
+};
+
 const applyUpstreamResponse = (
   upstreamResponse: any,
   reply: FastifyReply,
-  origin: string,
   proxyUrl: string,
   routePrefix: string,
   debug: boolean,
   requestId: string
 ): void => {
   const upstreamHeaders = { ...upstreamResponse.headers };
-  const blockedByResponseHeaders = new Set([
-    "clear-site-data",
-    "content-security-policy",
-    "content-security-policy-report-only",
-    "cross-origin-embedder-policy",
-    "cross-origin-embedder-policy-report-only",
-    "cross-origin-opener-policy",
-    "cross-origin-opener-policy-report-only",
-    "cross-origin-resource-policy",
-    "document-policy",
-    "nel",
-    "origin-agent-cluster",
-    "permissions-policy",
-    "report-to",
-    "x-content-security-policy",
-    "x-content-type-options",
-    "x-frame-options",
-    "x-webkit-csp",
-  ]);
-  const accessControlAllowOriginHeader =
-    upstreamHeaders["access-control-allow-origin"];
   const strippedHeaders: string[] = [];
-
-  if (
-    accessControlAllowOriginHeader &&
-    accessControlAllowOriginHeader !== origin
-  ) {
-    console.log(
-      chalk.blue(
-        "Override access-control-allow-origin header from proxied URL: " +
-          chalk.green(String(accessControlAllowOriginHeader)) +
-          "\n"
-      )
-    );
-    upstreamHeaders["access-control-allow-origin"] = origin;
-  }
 
   const locationHeader = upstreamHeaders.location;
   if (typeof locationHeader === "string") {
@@ -182,7 +331,7 @@ const applyUpstreamResponse = (
 
   reply.raw.statusCode = upstreamResponse.statusCode ?? 502;
   for (const headerName in upstreamHeaders) {
-    if (blockedByResponseHeaders.has(headerName.toLowerCase())) {
+    if (shouldStripResponseHeader(headerName)) {
       strippedHeaders.push(headerName);
       continue;
     }
@@ -218,46 +367,29 @@ const proxyRequest = (
   request: FastifyRequest,
   reply: FastifyReply,
   upstreamUrl: string,
-  origin: string,
   rejectUnauthorized: boolean,
   proxyUrl: string,
   routePrefix: string,
-  debug: boolean
+  debug: boolean,
+  browserHeaders: boolean
 ): void => {
   reply.hijack();
   const requestId = `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
   const startedAt = Date.now();
+  const proxyPublicBaseUrl = buildProxyPublicBaseUrl(request, routePrefix);
 
-  const requestHeaders: Record<string, string | string[] | undefined> = {};
-  const allowedHeaders = new Set([
-    "accept",
-    "accept-language",
-    "authorization",
-    "content-type",
-    "cookie",
-    "user-agent",
-  ]);
-
-  for (const [headerName, headerValue] of Object.entries(request.headers)) {
-    const normalizedName = headerName.toLowerCase();
-    if (headerValue === undefined) {
-      continue;
-    }
-
-    if (
-      allowedHeaders.has(normalizedName) ||
-      (normalizedName.startsWith("x-") &&
-        !normalizedName.startsWith("x-forwarded-"))
-    ) {
-      requestHeaders[normalizedName] = headerValue as string | string[];
-    }
-  }
+  const requestHeaders = buildRequestHeaders(
+    request.headers,
+    request.method,
+    browserHeaders
+  );
 
   logDebug(debug, "request.received", {
     requestId,
     method: request.method,
     incomingUrl: request.raw.url ?? "/",
     upstreamUrl,
+    proxyPublicBaseUrl,
     incomingHeaders: sanitizeHeadersForLog(
       request.headers as Record<string, string | string[] | number | undefined>
     ),
@@ -267,6 +399,7 @@ const proxyRequest = (
   const upstreamRequest = got.stream(upstreamUrl, {
     method: request.method as any,
     headers: requestHeaders,
+    decompress: true,
     throwHttpErrors: false,
     https: {
       rejectUnauthorized,
@@ -277,12 +410,56 @@ const proxyRequest = (
     applyUpstreamResponse(
       upstreamResponse,
       reply,
-      origin,
       proxyUrl,
       routePrefix,
       debug,
       requestId
     );
+
+    const rewriteBody = shouldRewriteBody(
+      request.method,
+      upstreamResponse.headers["content-type"]
+    );
+
+    if (!rewriteBody) {
+      upstreamResponse.pipe(reply.raw);
+      return;
+    }
+
+    const chunks: Buffer[] = [];
+    upstreamResponse.on("data", (chunk: Buffer | string) => {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    });
+    upstreamResponse.on("end", () => {
+      const originalBody = Buffer.concat(chunks).toString("utf8");
+      const rewritten = rewriteResponseBodyText(
+        originalBody,
+        proxyUrl,
+        proxyPublicBaseUrl
+      );
+
+      reply.raw.removeHeader("content-length");
+      reply.raw.removeHeader("transfer-encoding");
+      reply.raw.setHeader("content-length", Buffer.byteLength(rewritten.text, "utf8"));
+
+      logDebug(debug, "response.body_rewritten", {
+        requestId,
+        contentType: upstreamResponse.headers["content-type"] ?? "",
+        replacementCount: rewritten.replacementCount,
+      });
+
+      reply.raw.end(rewritten.text);
+    });
+    upstreamResponse.on("error", (error: any) => {
+      logDebug(debug, "response.stream_error", {
+        requestId,
+        message: error?.message ?? "Unknown upstream stream error",
+      });
+      if (!reply.raw.headersSent) {
+        reply.raw.statusCode = 502;
+      }
+      reply.raw.end();
+    });
   });
 
   upstreamRequest.on("error", (error: any) => {
@@ -308,12 +485,14 @@ const proxyRequest = (
   } else {
     request.raw.pipe(upstreamRequest);
   }
-  upstreamRequest.pipe(reply.raw);
   reply.raw.on("finish", () => {
     logDebug(debug, "request.finished", {
       requestId,
       elapsedMs: Date.now() - startedAt,
       finalStatusCode: reply.raw.statusCode,
+      finalHeaders: sanitizeHeadersForLog(
+        reply.raw.getHeaders() as Record<string, string | string[] | number | undefined>
+      ),
     });
   });
 };
@@ -326,14 +505,13 @@ const startProxy = async ({
   origin,
   rejectUnauthorized,
   debug,
+  browserHeaders,
 }: StartProxyOptions): Promise<void> => {
   const cleanProxyUrl = proxyUrl.replace(/\/$/, "");
   const cleanProxyPartial = proxyPartial.replace(/^\/+|\/+$/g, "");
   const useRootProxy = cleanProxyPartial.length === 0;
   const routePrefix = useRootProxy ? "" : `/${cleanProxyPartial}`;
   const proxy = Fastify();
-
-  await proxy.register(fastifyCors, { credentials, origin });
 
   if (useRootProxy) {
     proxy.route({
@@ -351,11 +529,11 @@ const startProxy = async ({
           request,
           reply,
           `${cleanProxyUrl}${proxiedPath}`,
-          origin,
           rejectUnauthorized,
           cleanProxyUrl,
           routePrefix,
-          debug
+          debug,
+          browserHeaders
         );
       },
     });
@@ -374,11 +552,11 @@ const startProxy = async ({
           request,
           reply,
           `${cleanProxyUrl}/`,
-          origin,
           rejectUnauthorized,
           cleanProxyUrl,
           routePrefix,
-          debug
+          debug,
+          browserHeaders
         );
       },
     });
@@ -402,11 +580,11 @@ const startProxy = async ({
           request,
           reply,
           `${cleanProxyUrl}${proxiedPath}`,
-          origin,
           rejectUnauthorized,
           cleanProxyUrl,
           routePrefix,
-          debug
+          debug,
+          browserHeaders
         );
       },
     });
@@ -425,11 +603,11 @@ const startProxy = async ({
           request,
           reply,
           `${cleanProxyUrl}/`,
-          origin,
           rejectUnauthorized,
           cleanProxyUrl,
           routePrefix,
-          debug
+          debug,
+          browserHeaders
         );
       },
     });
@@ -455,6 +633,9 @@ const startProxy = async ({
   console.log(chalk.blue("Origin: " + chalk.green(origin)));
   console.log(chalk.blue("Debug: " + chalk.green(debug ? "On" : "Off")));
   console.log(
+    chalk.blue("Browser Headers: " + chalk.green(browserHeaders ? "On" : "Off"))
+  );
+  console.log(
     chalk.blue(
       "Reject Unauthorized: " +
         chalk.green(rejectUnauthorized ? "Yes" : "No") +
@@ -478,6 +659,7 @@ const startProxy = async ({
     credentials,
     origin,
     rejectUnauthorized,
+    browserHeaders,
   });
 };
 
