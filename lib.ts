@@ -35,10 +35,56 @@ const normalizeHeaderValue = (
   return String(value);
 };
 
+const rewriteLocationHeader = (
+  locationHeader: string,
+  proxyUrl: string,
+  routePrefix: string
+): string => {
+  const trimmedLocation = locationHeader.trim();
+  const normalizedRoutePrefix = routePrefix === "" ? "" : routePrefix;
+
+  if (trimmedLocation.startsWith("/")) {
+    return normalizedRoutePrefix
+      ? `${normalizedRoutePrefix}${trimmedLocation}`
+      : trimmedLocation;
+  }
+
+  if (trimmedLocation.startsWith("//")) {
+    try {
+      const parsedProxyUrl = new URL(proxyUrl);
+      const protocolRelative = `${parsedProxyUrl.protocol}${trimmedLocation}`;
+      const parsedLocation = new URL(protocolRelative);
+      if (parsedLocation.origin === parsedProxyUrl.origin) {
+        return normalizedRoutePrefix
+          ? `${normalizedRoutePrefix}${parsedLocation.pathname}${parsedLocation.search}${parsedLocation.hash}`
+          : `${parsedLocation.pathname}${parsedLocation.search}${parsedLocation.hash}`;
+      }
+    } catch {
+      return locationHeader;
+    }
+  }
+
+  try {
+    const parsedProxyUrl = new URL(proxyUrl);
+    const parsedLocation = new URL(trimmedLocation);
+    if (parsedLocation.origin !== parsedProxyUrl.origin) {
+      return locationHeader;
+    }
+
+    return normalizedRoutePrefix
+      ? `${normalizedRoutePrefix}${parsedLocation.pathname}${parsedLocation.search}${parsedLocation.hash}`
+      : `${parsedLocation.pathname}${parsedLocation.search}${parsedLocation.hash}`;
+  } catch {
+    return locationHeader;
+  }
+};
+
 const applyUpstreamResponse = (
   upstreamResponse: any,
   reply: FastifyReply,
-  origin: string
+  origin: string,
+  proxyUrl: string,
+  routePrefix: string
 ): void => {
   const upstreamHeaders = { ...upstreamResponse.headers };
   const blockedByResponseHeaders = new Set([
@@ -46,7 +92,9 @@ const applyUpstreamResponse = (
     "content-security-policy",
     "content-security-policy-report-only",
     "cross-origin-embedder-policy",
+    "cross-origin-embedder-policy-report-only",
     "cross-origin-opener-policy",
+    "cross-origin-opener-policy-report-only",
     "cross-origin-resource-policy",
     "document-policy",
     "nel",
@@ -73,6 +121,15 @@ const applyUpstreamResponse = (
       )
     );
     upstreamHeaders["access-control-allow-origin"] = origin;
+  }
+
+  const locationHeader = upstreamHeaders.location;
+  if (typeof locationHeader === "string") {
+    upstreamHeaders.location = rewriteLocationHeader(
+      locationHeader,
+      proxyUrl,
+      routePrefix
+    );
   }
 
   reply.raw.statusCode = upstreamResponse.statusCode ?? 502;
@@ -104,7 +161,9 @@ const proxyRequest = (
   reply: FastifyReply,
   upstreamUrl: string,
   origin: string,
-  rejectUnauthorized: boolean
+  rejectUnauthorized: boolean,
+  proxyUrl: string,
+  routePrefix: string
 ): void => {
   reply.hijack();
 
@@ -143,7 +202,7 @@ const proxyRequest = (
   });
 
   upstreamRequest.on("response", (upstreamResponse: any) => {
-    applyUpstreamResponse(upstreamResponse, reply, origin);
+    applyUpstreamResponse(upstreamResponse, reply, origin, proxyUrl, routePrefix);
   });
 
   upstreamRequest.on("error", (error: any) => {
@@ -198,7 +257,9 @@ const startProxy = async ({
           reply,
           `${cleanProxyUrl}${proxiedPath}`,
           origin,
-          rejectUnauthorized
+          rejectUnauthorized,
+          cleanProxyUrl,
+          routePrefix
         );
       },
     });
@@ -218,7 +279,9 @@ const startProxy = async ({
           reply,
           `${cleanProxyUrl}/`,
           origin,
-          rejectUnauthorized
+          rejectUnauthorized,
+          cleanProxyUrl,
+          routePrefix
         );
       },
     });
@@ -243,7 +306,9 @@ const startProxy = async ({
           reply,
           `${cleanProxyUrl}${proxiedPath}`,
           origin,
-          rejectUnauthorized
+          rejectUnauthorized,
+          cleanProxyUrl,
+          routePrefix
         );
       },
     });
@@ -263,7 +328,9 @@ const startProxy = async ({
           reply,
           `${cleanProxyUrl}/`,
           origin,
-          rejectUnauthorized
+          rejectUnauthorized,
+          cleanProxyUrl,
+          routePrefix
         );
       },
     });
