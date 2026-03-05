@@ -9,6 +9,7 @@ type CliOptions = {
   credentials: boolean;
   origin: string;
   rejectUnauthorized: number;
+  debug: boolean;
 };
 
 const optionDefinitions = [
@@ -18,6 +19,7 @@ const optionDefinitions = [
   { name: "credentials", type: Boolean, defaultValue: false },
   { name: "origin", type: String, defaultValue: "*" },
   { name: "rejectUnauthorized", type: Number, defaultValue: 0 },
+  { name: "debug", alias: "d", type: Boolean, defaultValue: false },
 ];
 
 const run = async (): Promise<void> => {
@@ -34,6 +36,7 @@ const run = async (): Promise<void> => {
     credentials: options.credentials,
     origin: options.origin,
     rejectUnauthorized: Boolean(options.rejectUnauthorized),
+    debug: options.debug,
   });
 };
 

@@ -10,6 +10,7 @@ type StartProxyOptions = {
   credentials: boolean;
   origin: string;
   rejectUnauthorized: boolean;
+  debug: boolean;
 };
 
 const PROXY_METHODS: Array<"DELETE" | "GET" | "HEAD" | "PATCH" | "POST" | "PUT"> = [
@@ -33,6 +34,42 @@ const normalizeHeaderValue = (
   }
 
   return String(value);
+};
+
+const getDebugTimestamp = (): string => new Date().toISOString();
+
+const sanitizeHeadersForLog = (
+  headers: Record<string, string | string[] | number | undefined>
+): Record<string, string | string[] | number | undefined> => {
+  const redactedHeaders = new Set(["authorization", "cookie", "set-cookie"]);
+  const sanitized: Record<string, string | string[] | number | undefined> = {};
+
+  for (const [headerName, headerValue] of Object.entries(headers)) {
+    const normalizedName = headerName.toLowerCase();
+    sanitized[headerName] = redactedHeaders.has(normalizedName)
+      ? "[REDACTED]"
+      : headerValue;
+  }
+
+  return sanitized;
+};
+
+const logDebug = (
+  debugEnabled: boolean,
+  event: string,
+  details: Record<string, unknown>
+): void => {
+  if (!debugEnabled) {
+    return;
+  }
+
+  const payload = {
+    ts: getDebugTimestamp(),
+    event,
+    ...details,
+  };
+
+  console.log(`[lcp-debug] ${JSON.stringify(payload)}`);
 };
 
 const rewriteLocationHeader = (
@@ -84,7 +121,9 @@ const applyUpstreamResponse = (
   reply: FastifyReply,
   origin: string,
   proxyUrl: string,
-  routePrefix: string
+  routePrefix: string,
+  debug: boolean,
+  requestId: string
 ): void => {
   const upstreamHeaders = { ...upstreamResponse.headers };
   const blockedByResponseHeaders = new Set([
@@ -108,6 +147,7 @@ const applyUpstreamResponse = (
   ]);
   const accessControlAllowOriginHeader =
     upstreamHeaders["access-control-allow-origin"];
+  const strippedHeaders: string[] = [];
 
   if (
     accessControlAllowOriginHeader &&
@@ -125,16 +165,25 @@ const applyUpstreamResponse = (
 
   const locationHeader = upstreamHeaders.location;
   if (typeof locationHeader === "string") {
-    upstreamHeaders.location = rewriteLocationHeader(
+    const rewrittenLocation = rewriteLocationHeader(
       locationHeader,
       proxyUrl,
       routePrefix
     );
+    upstreamHeaders.location = rewrittenLocation;
+    if (rewrittenLocation !== locationHeader) {
+      logDebug(debug, "response.location_rewritten", {
+        requestId,
+        before: locationHeader,
+        after: rewrittenLocation,
+      });
+    }
   }
 
   reply.raw.statusCode = upstreamResponse.statusCode ?? 502;
   for (const headerName in upstreamHeaders) {
     if (blockedByResponseHeaders.has(headerName.toLowerCase())) {
+      strippedHeaders.push(headerName);
       continue;
     }
 
@@ -154,6 +203,15 @@ const applyUpstreamResponse = (
   );
   reply.raw.setHeader("pragma", "no-cache");
   reply.raw.setHeader("expires", "0");
+
+  logDebug(debug, "response.upstream", {
+    requestId,
+    statusCode: upstreamResponse.statusCode ?? 502,
+    strippedHeaders,
+    upstreamHeaders: sanitizeHeadersForLog(
+      upstreamHeaders as Record<string, string | string[] | number | undefined>
+    ),
+  });
 };
 
 const proxyRequest = (
@@ -163,9 +221,12 @@ const proxyRequest = (
   origin: string,
   rejectUnauthorized: boolean,
   proxyUrl: string,
-  routePrefix: string
+  routePrefix: string,
+  debug: boolean
 ): void => {
   reply.hijack();
+  const requestId = `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+  const startedAt = Date.now();
 
   const requestHeaders: Record<string, string | string[] | undefined> = {};
   const allowedHeaders = new Set([
@@ -192,6 +253,17 @@ const proxyRequest = (
     }
   }
 
+  logDebug(debug, "request.received", {
+    requestId,
+    method: request.method,
+    incomingUrl: request.raw.url ?? "/",
+    upstreamUrl,
+    incomingHeaders: sanitizeHeadersForLog(
+      request.headers as Record<string, string | string[] | number | undefined>
+    ),
+    forwardedHeaders: sanitizeHeadersForLog(requestHeaders),
+  });
+
   const upstreamRequest = got.stream(upstreamUrl, {
     method: request.method as any,
     headers: requestHeaders,
@@ -202,10 +274,25 @@ const proxyRequest = (
   });
 
   upstreamRequest.on("response", (upstreamResponse: any) => {
-    applyUpstreamResponse(upstreamResponse, reply, origin, proxyUrl, routePrefix);
+    applyUpstreamResponse(
+      upstreamResponse,
+      reply,
+      origin,
+      proxyUrl,
+      routePrefix,
+      debug,
+      requestId
+    );
   });
 
   upstreamRequest.on("error", (error: any) => {
+    logDebug(debug, "request.error", {
+      requestId,
+      elapsedMs: Date.now() - startedAt,
+      message: error?.message ?? "Unknown proxy error",
+      name: error?.name ?? "Error",
+      code: error?.code ?? null,
+    });
     console.error(chalk.red(`Proxy request failed: ${error.message}`));
     if (!reply.raw.headersSent) {
       reply.raw.statusCode = 502;
@@ -222,6 +309,13 @@ const proxyRequest = (
     request.raw.pipe(upstreamRequest);
   }
   upstreamRequest.pipe(reply.raw);
+  reply.raw.on("finish", () => {
+    logDebug(debug, "request.finished", {
+      requestId,
+      elapsedMs: Date.now() - startedAt,
+      finalStatusCode: reply.raw.statusCode,
+    });
+  });
 };
 
 const startProxy = async ({
@@ -231,6 +325,7 @@ const startProxy = async ({
   credentials,
   origin,
   rejectUnauthorized,
+  debug,
 }: StartProxyOptions): Promise<void> => {
   const cleanProxyUrl = proxyUrl.replace(/\/$/, "");
   const cleanProxyPartial = proxyPartial.replace(/^\/+|\/+$/g, "");
@@ -259,7 +354,8 @@ const startProxy = async ({
           origin,
           rejectUnauthorized,
           cleanProxyUrl,
-          routePrefix
+          routePrefix,
+          debug
         );
       },
     });
@@ -281,7 +377,8 @@ const startProxy = async ({
           origin,
           rejectUnauthorized,
           cleanProxyUrl,
-          routePrefix
+          routePrefix,
+          debug
         );
       },
     });
@@ -308,7 +405,8 @@ const startProxy = async ({
           origin,
           rejectUnauthorized,
           cleanProxyUrl,
-          routePrefix
+          routePrefix,
+          debug
         );
       },
     });
@@ -330,7 +428,8 @@ const startProxy = async ({
           origin,
           rejectUnauthorized,
           cleanProxyUrl,
-          routePrefix
+          routePrefix,
+          debug
         );
       },
     });
@@ -354,6 +453,7 @@ const startProxy = async ({
   console.log(chalk.blue("PORT: " + chalk.green(String(port))));
   console.log(chalk.blue("Credentials: " + chalk.green(String(credentials))));
   console.log(chalk.blue("Origin: " + chalk.green(origin)));
+  console.log(chalk.blue("Debug: " + chalk.green(debug ? "On" : "Off")));
   console.log(
     chalk.blue(
       "Reject Unauthorized: " +
@@ -371,6 +471,14 @@ const startProxy = async ({
         )
     )
   );
+  logDebug(debug, "proxy.start", {
+    port,
+    proxyUrl: cleanProxyUrl,
+    proxyPartial: useRootProxy ? "/" : cleanProxyPartial,
+    credentials,
+    origin,
+    rejectUnauthorized,
+  });
 };
 
 export { startProxy };
