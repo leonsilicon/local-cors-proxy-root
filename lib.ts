@@ -316,6 +316,7 @@ const applyUpstreamResponse = (
 ): void => {
   const upstreamHeaders = { ...upstreamResponse.headers };
   const strippedHeaders: string[] = [];
+  const forwardedHeaders: string[] = [];
 
   const locationHeader = upstreamHeaders.location;
   if (typeof locationHeader === "string") {
@@ -347,6 +348,7 @@ const applyUpstreamResponse = (
     );
     if (normalizedValue !== undefined) {
       reply.raw.setHeader(headerName, normalizedValue);
+      forwardedHeaders.push(headerName);
     }
   }
 
@@ -362,6 +364,7 @@ const applyUpstreamResponse = (
     requestId,
     statusCode: upstreamResponse.statusCode ?? 502,
     strippedHeaders,
+    forwardedHeaders,
     upstreamHeaders: sanitizeHeadersForLog(
       upstreamHeaders as Record<string, string | string[] | number | undefined>
     ),
@@ -400,6 +403,13 @@ const proxyRequest = (
     ),
     forwardedHeaders: sanitizeHeadersForLog(requestHeaders),
   });
+  logDebug(debug, "upstream.request_start", {
+    requestId,
+    method: request.method,
+    upstreamUrl,
+    rejectUnauthorized,
+    browserHeaders,
+  });
 
   const upstreamRequest = got.stream(upstreamUrl, {
     method: request.method as any,
@@ -410,8 +420,19 @@ const proxyRequest = (
       rejectUnauthorized,
     },
   });
+  upstreamRequest.on("redirect", (response: any, nextOptions: any) => {
+    logDebug(debug, "upstream.redirect", {
+      requestId,
+      statusCode: response?.statusCode ?? null,
+      location: response?.headers?.location ?? null,
+      nextUrl: nextOptions?.url?.toString?.() ?? String(nextOptions?.url ?? ""),
+    });
+  });
 
   upstreamRequest.on("response", (upstreamResponse: any) => {
+    let upstreamBytes = 0;
+    let upstreamChunks = 0;
+
     applyUpstreamResponse(
       upstreamResponse,
       reply,
@@ -425,17 +446,70 @@ const proxyRequest = (
       request.method,
       upstreamResponse.headers["content-type"]
     );
+    logDebug(debug, "response.rewrite_decision", {
+      requestId,
+      method: request.method,
+      contentType: String(upstreamResponse.headers["content-type"] ?? ""),
+      rewriteBody,
+    });
+    upstreamResponse.on("aborted", () => {
+      logDebug(debug, "upstream.response_aborted", {
+        requestId,
+        receivedBytes: upstreamBytes,
+        receivedChunks: upstreamChunks,
+      });
+    });
+    upstreamResponse.on("close", () => {
+      logDebug(debug, "upstream.response_close", {
+        requestId,
+        receivedBytes: upstreamBytes,
+        receivedChunks: upstreamChunks,
+      });
+    });
+    upstreamResponse.on("error", (error: any) => {
+      logDebug(debug, "response.stream_error", {
+        requestId,
+        message: error?.message ?? "Unknown upstream stream error",
+      });
+      if (!reply.raw.headersSent) {
+        reply.raw.statusCode = 502;
+      }
+      reply.raw.end();
+    });
 
     if (!rewriteBody) {
+      upstreamResponse.on("data", (chunk: Buffer | string) => {
+        const size = Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk);
+        upstreamBytes += size;
+        upstreamChunks += 1;
+      });
+      upstreamResponse.on("end", () => {
+        logDebug(debug, "upstream.response_end", {
+          requestId,
+          receivedBytes: upstreamBytes,
+          receivedChunks: upstreamChunks,
+        });
+      });
       upstreamResponse.pipe(reply.raw);
+      logDebug(debug, "response.pass_through_stream", {
+        requestId,
+      });
       return;
     }
 
     const chunks: Buffer[] = [];
     upstreamResponse.on("data", (chunk: Buffer | string) => {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      const normalizedChunk = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      chunks.push(normalizedChunk);
+      upstreamBytes += normalizedChunk.length;
+      upstreamChunks += 1;
     });
     upstreamResponse.on("end", () => {
+      logDebug(debug, "upstream.response_end", {
+        requestId,
+        receivedBytes: upstreamBytes,
+        receivedChunks: upstreamChunks,
+      });
       try {
         const originalBody = Buffer.concat(chunks).toString("utf8");
         const rewritten = rewriteResponseBodyText(
@@ -451,6 +525,9 @@ const proxyRequest = (
         logDebug(debug, "response.body_rewritten", {
           requestId,
           contentType: upstreamResponse.headers["content-type"] ?? "",
+          originalBytes: Buffer.byteLength(originalBody, "utf8"),
+          rewrittenBytes: Buffer.byteLength(rewritten.text, "utf8"),
+          chunkCount: chunks.length,
           replacementCount: rewritten.replacementCount,
         });
 
@@ -462,20 +539,13 @@ const proxyRequest = (
         reply.raw.setHeader("content-length", Buffer.byteLength(originalBody, "utf8"));
         logDebug(debug, "response.body_rewrite_error", {
           requestId,
+          contentType: upstreamResponse.headers["content-type"] ?? "",
+          originalBytes: Buffer.byteLength(originalBody, "utf8"),
+          chunkCount: chunks.length,
           message: error?.message ?? "Unknown body rewrite error",
         });
         reply.raw.end(originalBody);
       }
-    });
-    upstreamResponse.on("error", (error: any) => {
-      logDebug(debug, "response.stream_error", {
-        requestId,
-        message: error?.message ?? "Unknown upstream stream error",
-      });
-      if (!reply.raw.headersSent) {
-        reply.raw.statusCode = 502;
-      }
-      reply.raw.end();
     });
   });
 
@@ -496,12 +566,45 @@ const proxyRequest = (
       reply.raw.end();
     }
   });
+  upstreamRequest.on("close", () => {
+    logDebug(debug, "upstream.request_close", {
+      requestId,
+      elapsedMs: Date.now() - startedAt,
+    });
+  });
 
   if (request.method === "GET" || request.method === "HEAD") {
     upstreamRequest.end();
   } else {
     request.raw.pipe(upstreamRequest);
   }
+  request.raw.on("aborted", () => {
+    logDebug(debug, "client.request_aborted", {
+      requestId,
+      elapsedMs: Date.now() - startedAt,
+    });
+  });
+  request.raw.on("close", () => {
+    logDebug(debug, "client.request_close", {
+      requestId,
+      elapsedMs: Date.now() - startedAt,
+    });
+  });
+  reply.raw.on("close", () => {
+    logDebug(debug, "client.response_close", {
+      requestId,
+      elapsedMs: Date.now() - startedAt,
+      writableEnded: reply.raw.writableEnded,
+      headersSent: reply.raw.headersSent,
+    });
+  });
+  reply.raw.on("error", (error: any) => {
+    logDebug(debug, "client.response_error", {
+      requestId,
+      elapsedMs: Date.now() - startedAt,
+      message: error?.message ?? "Unknown response socket error",
+    });
+  });
   reply.raw.on("finish", () => {
     logDebug(debug, "request.finished", {
       requestId,
