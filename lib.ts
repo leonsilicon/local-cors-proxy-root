@@ -12,6 +12,15 @@ type StartProxyOptions = {
   rejectUnauthorized: boolean;
 };
 
+const PROXY_METHODS: Array<"DELETE" | "GET" | "HEAD" | "PATCH" | "POST" | "PUT"> = [
+  "DELETE",
+  "GET",
+  "HEAD",
+  "PATCH",
+  "POST",
+  "PUT",
+];
+
 const normalizeHeaderValue = (
   value: string | string[] | number | undefined
 ): string | string[] | undefined => {
@@ -136,64 +145,116 @@ const startProxy = async ({
   rejectUnauthorized,
 }: StartProxyOptions): Promise<void> => {
   const cleanProxyUrl = proxyUrl.replace(/\/$/, "");
-  const cleanProxyPartial = proxyPartial.replace(/\//g, "");
-  const routePrefix = `/${cleanProxyPartial}`;
+  const cleanProxyPartial = proxyPartial.replace(/^\/+|\/+$/g, "");
+  const useRootProxy = cleanProxyPartial.length === 0;
+  const routePrefix = useRootProxy ? "" : `/${cleanProxyPartial}`;
   const proxy = Fastify();
 
   await proxy.register(fastifyCors, { credentials, origin });
 
-  proxy.route({
-    method: ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"],
-    url: `${routePrefix}/*`,
-    handler: async (request: FastifyRequest, reply: FastifyReply) => {
-      const requestUrl = request.raw.url ?? "/";
-      const proxiedPath = requestUrl.startsWith(routePrefix)
-        ? requestUrl.slice(routePrefix.length) || "/"
-        : requestUrl;
+  if (useRootProxy) {
+    proxy.route({
+      method: PROXY_METHODS,
+      url: "/*",
+      handler: async (request: FastifyRequest, reply: FastifyReply) => {
+        const proxiedPath = request.raw.url ?? "/";
+        try {
+          console.log(chalk.green(`Request Proxied -> ${proxiedPath}`));
+        } catch {
+          // ignore logging errors
+        }
 
-      try {
-        console.log(chalk.green(`Request Proxied -> ${proxiedPath}`));
-      } catch {
-        // ignore logging errors
-      }
-
-      proxyRequest(
-        request,
-        reply,
-        `${cleanProxyUrl}${proxiedPath}`,
-        origin,
-        rejectUnauthorized
-      );
-    },
-  });
-
-  proxy.route({
-    method: ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"],
-    url: routePrefix,
-    handler: async (request: FastifyRequest, reply: FastifyReply) => {
-      try {
-        console.log(chalk.green("Request Proxied -> /"));
-      } catch {
-        // ignore logging errors
-      }
-
-      proxyRequest(request, reply, `${cleanProxyUrl}/`, origin, rejectUnauthorized);
-    },
-  });
-
-  proxy.get("/", async (_request: FastifyRequest, reply: FastifyReply) => {
-    reply.status(200).send({
-      message: "Local CORS proxy is running",
-      usage: `Use http://localhost:${port}${routePrefix}/* to proxy requests`,
-      proxyUrl: cleanProxyUrl,
+        proxyRequest(
+          request,
+          reply,
+          `${cleanProxyUrl}${proxiedPath}`,
+          origin,
+          rejectUnauthorized
+        );
+      },
     });
-  });
+
+    proxy.route({
+      method: PROXY_METHODS,
+      url: "/",
+      handler: async (request: FastifyRequest, reply: FastifyReply) => {
+        try {
+          console.log(chalk.green("Request Proxied -> /"));
+        } catch {
+          // ignore logging errors
+        }
+
+        proxyRequest(
+          request,
+          reply,
+          `${cleanProxyUrl}/`,
+          origin,
+          rejectUnauthorized
+        );
+      },
+    });
+  } else {
+    proxy.route({
+      method: PROXY_METHODS,
+      url: `${routePrefix}/*`,
+      handler: async (request: FastifyRequest, reply: FastifyReply) => {
+        const requestUrl = request.raw.url ?? "/";
+        const proxiedPath = requestUrl.startsWith(routePrefix)
+          ? requestUrl.slice(routePrefix.length) || "/"
+          : requestUrl;
+
+        try {
+          console.log(chalk.green(`Request Proxied -> ${proxiedPath}`));
+        } catch {
+          // ignore logging errors
+        }
+
+        proxyRequest(
+          request,
+          reply,
+          `${cleanProxyUrl}${proxiedPath}`,
+          origin,
+          rejectUnauthorized
+        );
+      },
+    });
+
+    proxy.route({
+      method: PROXY_METHODS,
+      url: routePrefix,
+      handler: async (request: FastifyRequest, reply: FastifyReply) => {
+        try {
+          console.log(chalk.green("Request Proxied -> /"));
+        } catch {
+          // ignore logging errors
+        }
+
+        proxyRequest(
+          request,
+          reply,
+          `${cleanProxyUrl}/`,
+          origin,
+          rejectUnauthorized
+        );
+      },
+    });
+
+    proxy.get("/", async (_request: FastifyRequest, reply: FastifyReply) => {
+      reply.status(200).send({
+        message: "Local CORS proxy is running",
+        usage: `Use http://localhost:${port}${routePrefix}/* to proxy requests`,
+        proxyUrl: cleanProxyUrl,
+      });
+    });
+  }
 
   await proxy.listen({ port });
 
   console.log(chalk.bgGreen.black.bold.underline("\n Proxy Active \n"));
   console.log(chalk.blue("Proxy Url: " + chalk.green(cleanProxyUrl)));
-  console.log(chalk.blue("Proxy Partial: " + chalk.green(cleanProxyPartial)));
+  console.log(
+    chalk.blue("Proxy Partial: " + chalk.green(useRootProxy ? "/" : cleanProxyPartial))
+  );
   console.log(chalk.blue("PORT: " + chalk.green(String(port))));
   console.log(chalk.blue("Credentials: " + chalk.green(String(credentials))));
   console.log(chalk.blue("Origin: " + chalk.green(origin)));
@@ -207,7 +268,11 @@ const startProxy = async ({
   console.log(
     chalk.cyan(
       "To start using the proxy simply replace the proxied part of your url with: " +
-        chalk.bold(`http://localhost:${port}/${cleanProxyPartial}\n`)
+        chalk.bold(
+          useRootProxy
+            ? `http://localhost:${port}/\n`
+            : `http://localhost:${port}/${cleanProxyPartial}\n`
+        )
     )
   );
 };

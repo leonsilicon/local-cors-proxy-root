@@ -13,7 +13,7 @@ type CliOptions = {
 
 const optionDefinitions = [
   { name: "port", alias: "p", type: Number, defaultValue: 8010 },
-  { name: "proxyPartial", type: String, defaultValue: "/proxy" },
+  { name: "proxyPartial", type: String, defaultValue: "/" },
   { name: "proxyUrl", type: String },
   { name: "credentials", type: Boolean, defaultValue: false },
   { name: "origin", type: String, defaultValue: "*" },
