@@ -21,17 +21,14 @@
     "node",
     "fastify"
   ],
-  "dependencies": {
+  "devDependencies": {
+    "@types/command-line-args": "^5.2.3",
+    "@types/node": "^25.3.3",
     "@fastify/cors": "^11.1.0",
     "chalk": "latest",
     "command-line-args": "latest",
     "fastify": "^5.6.1",
-    "got": "^14.6.6"
-  },
-  "devDependencies": {
-    "@types/command-line-args": "^5.2.3",
-    "@types/node": "^25.3.3",
-    "tsx": "^4.21.0",
+    "got": "^14.6.6",
     "typescript": "^5.9.3",
     "@types/bun": "latest"
   }
