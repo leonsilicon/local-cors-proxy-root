@@ -44,6 +44,9 @@ const shouldStripResponseHeader = (headerName: string): boolean => {
   }
 
   const blockedByName = new Set([
+    "accept-ch",
+    "accept-ch-lifetime",
+    "alt-svc",
     "clear-site-data",
     "content-disposition",
     "content-security-policy",
@@ -54,11 +57,13 @@ const shouldStripResponseHeader = (headerName: string): boolean => {
     "cross-origin-opener-policy-report-only",
     "cross-origin-resource-policy",
     "document-policy",
+    "expect-ct",
     "nel",
     "origin-agent-cluster",
     "permissions-policy",
     "referrer-policy",
     "report-to",
+    "strict-transport-security",
     "x-content-security-policy",
     "x-content-type-options",
     "x-download-options",
@@ -431,24 +436,36 @@ const proxyRequest = (
       chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     });
     upstreamResponse.on("end", () => {
-      const originalBody = Buffer.concat(chunks).toString("utf8");
-      const rewritten = rewriteResponseBodyText(
-        originalBody,
-        proxyUrl,
-        proxyPublicBaseUrl
-      );
+      try {
+        const originalBody = Buffer.concat(chunks).toString("utf8");
+        const rewritten = rewriteResponseBodyText(
+          originalBody,
+          proxyUrl,
+          proxyPublicBaseUrl
+        );
 
-      reply.raw.removeHeader("content-length");
-      reply.raw.removeHeader("transfer-encoding");
-      reply.raw.setHeader("content-length", Buffer.byteLength(rewritten.text, "utf8"));
+        reply.raw.removeHeader("content-length");
+        reply.raw.removeHeader("transfer-encoding");
+        reply.raw.setHeader("content-length", Buffer.byteLength(rewritten.text, "utf8"));
 
-      logDebug(debug, "response.body_rewritten", {
-        requestId,
-        contentType: upstreamResponse.headers["content-type"] ?? "",
-        replacementCount: rewritten.replacementCount,
-      });
+        logDebug(debug, "response.body_rewritten", {
+          requestId,
+          contentType: upstreamResponse.headers["content-type"] ?? "",
+          replacementCount: rewritten.replacementCount,
+        });
 
-      reply.raw.end(rewritten.text);
+        reply.raw.end(rewritten.text);
+      } catch (error: any) {
+        const originalBody = Buffer.concat(chunks).toString("utf8");
+        reply.raw.removeHeader("content-length");
+        reply.raw.removeHeader("transfer-encoding");
+        reply.raw.setHeader("content-length", Buffer.byteLength(originalBody, "utf8"));
+        logDebug(debug, "response.body_rewrite_error", {
+          requestId,
+          message: error?.message ?? "Unknown body rewrite error",
+        });
+        reply.raw.end(originalBody);
+      }
     });
     upstreamResponse.on("error", (error: any) => {
       logDebug(debug, "response.stream_error", {
