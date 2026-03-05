@@ -41,6 +41,14 @@ const applyUpstreamResponse = (
   origin: string
 ): void => {
   const upstreamHeaders = { ...upstreamResponse.headers };
+  const blockedByResponseHeaders = new Set([
+    "content-security-policy",
+    "content-security-policy-report-only",
+    "cross-origin-embedder-policy",
+    "cross-origin-opener-policy",
+    "cross-origin-resource-policy",
+    "x-frame-options",
+  ]);
   const accessControlAllowOriginHeader =
     upstreamHeaders["access-control-allow-origin"];
 
@@ -60,6 +68,10 @@ const applyUpstreamResponse = (
 
   reply.raw.statusCode = upstreamResponse.statusCode ?? 502;
   for (const headerName in upstreamHeaders) {
+    if (blockedByResponseHeaders.has(headerName.toLowerCase())) {
+      continue;
+    }
+
     const headerValue = upstreamHeaders[headerName];
     const normalizedValue = normalizeHeaderValue(
       headerValue as string | string[] | number | undefined
