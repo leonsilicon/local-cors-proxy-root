@@ -42,12 +42,21 @@ const applyUpstreamResponse = (
 ): void => {
   const upstreamHeaders = { ...upstreamResponse.headers };
   const blockedByResponseHeaders = new Set([
+    "clear-site-data",
     "content-security-policy",
     "content-security-policy-report-only",
     "cross-origin-embedder-policy",
     "cross-origin-opener-policy",
     "cross-origin-resource-policy",
+    "document-policy",
+    "nel",
+    "origin-agent-cluster",
+    "permissions-policy",
+    "report-to",
+    "x-content-security-policy",
+    "x-content-type-options",
     "x-frame-options",
+    "x-webkit-csp",
   ]);
   const accessControlAllowOriginHeader =
     upstreamHeaders["access-control-allow-origin"];
@@ -80,6 +89,14 @@ const applyUpstreamResponse = (
       reply.raw.setHeader(headerName, normalizedValue);
     }
   }
+
+  // Avoid reusing cached responses that may still carry blocked headers.
+  reply.raw.setHeader(
+    "cache-control",
+    "no-store, no-cache, must-revalidate, proxy-revalidate"
+  );
+  reply.raw.setHeader("pragma", "no-cache");
+  reply.raw.setHeader("expires", "0");
 };
 
 const proxyRequest = (
